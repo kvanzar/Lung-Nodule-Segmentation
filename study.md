@@ -1,14 +1,14 @@
 # Interview Study Guide — Lung Cancer Prediction with CNN & Transfer Learning
 
-Everything you need to explain this project confidently. Numbers in here come from your actual training run — you can defend every one of them.
+Everything you need to explain this project confidently. Numbers in here come from your actual training runs — you can defend every one of them. Where a number says **TBD**, fill it in from your notebook's saved output before an interview — don't guess.
 
 ---
 
 ## 1. The 30-Second Elevator Pitch
 
-> "I built a deep learning model that classifies chest CT scans into three types of lung cancer — adenocarcinoma, large cell carcinoma, squamous cell carcinoma — plus normal. Instead of training a network from scratch, I fine-tuned a ResNet50 that was pretrained on ImageNet, which let me get strong results from only about a thousand medical images. It reached 81.3% accuracy and 0.946 AUC on a held-out test set, and importantly, it never confused a cancerous scan with a normal one — 100% precision and recall on the normal class."
+> "I built a deep learning model that classifies chest CT scans into three types of lung cancer — adenocarcinoma, large cell carcinoma, squamous cell carcinoma — plus normal. Instead of training a network from scratch, I fine-tuned a ResNet50 pretrained on ImageNet, which let me get strong results from only about a thousand medical images. My baseline reached 81.3% accuracy and 0.946 AUC; after adding class-weighted loss and a learning-rate scheduler to fix a class-imbalance issue I found in the confusion matrix, it improved to about 83%. It also never confused a cancerous scan with a normal one — 100% precision and recall on the normal class. I then benchmarked a second architecture, EfficientNet-B0, under the identical training protocol to see whether the accuracy ceiling was the architecture or the data."
 
-Practice saying this out loud. It's your opener for "tell me about a project."
+Practice saying this out loud. It's your opener for "tell me about a project." The **improvement story** (81.3% → 83% via a diagnosed fix, not guesswork) is more impressive than either number alone — lead with it if asked "what did you learn/iterate on?"
 
 ---
 
@@ -29,9 +29,10 @@ Practice saying this out loud. It's your opener for "tell me about a project."
 2. **Preprocess:** resize everything to 224×224 (what ResNet expects), convert to tensors, normalize with ImageNet channel statistics.
 3. **Augment training data only:** random rotation (±10°), horizontal flips, small shifts/zooms, slight brightness/contrast changes. Each epoch the model sees slightly different versions of each image, which acts like having more data and reduces overfitting.
 4. **Model:** ResNet50 pretrained on ImageNet. Freeze almost everything; unfreeze the last block (`layer4`) and replace the final classifier with a new head: `Linear(2048→512) → ReLU → Dropout(0.5) → Linear(512→4)`.
-5. **Train** for 25 epochs with Adam, cross-entropy loss weighted by class frequency, and two learning rates: tiny (1e-5) for `layer4`, larger (1e-4) for the new head. A scheduler halves the learning rate when validation loss stops improving.
+5. **Train** for 25 epochs with Adam, cross-entropy loss weighted by class frequency, and two learning rates: tiny (1e-5) for `layer4`, larger (1e-4) for the new head. A scheduler halves the learning rate when validation loss stops improving. The forward pass runs in mixed precision (fp16 via `torch.autocast`) on the GPU for faster training with negligible accuracy cost.
 6. **Checkpoint:** after every epoch, if validation loss hit a new low, save the model. At the end, load the best checkpoint — not the last one.
 7. **Evaluate** on the untouched test set with accuracy, precision/recall/F1, specificity, confusion matrix, Cohen's Kappa, MCC, and ROC curves.
+8. **Benchmark a second architecture:** retrain the identical protocol (same augmentation, same class-weighted loss, same discriminative LR scheme, same scheduler) on EfficientNet-B0 instead of ResNet50, then compare both on the same test set — isolates whether the architecture or the training recipe is the accuracy bottleneck.
 
 ---
 
@@ -59,9 +60,19 @@ Practice saying this out loud. It's your opener for "tell me about a project."
 
 **Checkpointing on validation loss (early-stopping style):** training loss kept falling to 0.07, but validation loss bottomed out around epoch 18 and then wobbled — the model was starting to memorize. By saving only when validation loss improved, I effectively picked the model from its best-generalizing epoch, not the most-memorized one.
 
+**Mixed precision training (AMP / `torch.autocast`):** most of the forward pass runs in 16-bit floating point instead of 32-bit. Half the memory per tensor and much faster matrix multiplication on GPU tensor cores (both NVIDIA CUDA and Apple's MPS support this), with accuracy impact that's negligible for fine-tuning because gradients still accumulate correctly — PyTorch's autocast automatically keeps numerically sensitive ops (like softmax/loss) in fp32. I benchmarked it directly on my machine's GPU and saw roughly a 10x speedup on a training-step microbenchmark before adopting it.
+
+**Why benchmark a second architecture (EfficientNet-B0):** any single result begs the question "is 83% the ceiling for this data, or the ceiling for ResNet50?" Retraining a smaller, more parameter-efficient architecture under the exact same protocol (same data, same augmentation, same loss weighting, same LR schedule) isolates that variable. It's also a more convincing engineering story than a single number: it shows I think about model selection empirically rather than picking one architecture and stopping.
+
+**EfficientNet-B0 and MBConv blocks:** EfficientNet uses "mobile inverted bottleneck" (MBConv) blocks — depthwise separable convolutions (a spatial filter per channel, then a 1×1 convolution to mix channels) instead of ResNet's regular convolutions. This does the same job with far fewer parameters and FLOPs (EfficientNet-B0: ~5M params vs. ResNet50's ~25M) because a standard convolution mixes space and channels in one expensive operation, while depthwise-separable splits that into two cheap ones. EfficientNet also uses **squeeze-and-excitation** blocks — a small gate that lets the network re-weight channels by importance (a lightweight form of attention) — which ResNet50 doesn't have. The tradeoff: EfficientNet is more efficient per parameter but was originally tuned for larger, more varied datasets than ~1,000 CT images, so which one wins here is genuinely an empirical question, not a foregone conclusion.
+
+**Why unfreeze `features[7:9]` on EfficientNet instead of `layer4` like ResNet?** EfficientNet doesn't have a `layer4` — its backbone is a flat `features` list of 9 stages (`features[0]`...`features[8]`) instead of 4 named residual stages. `features[7]` is the last MBConv stage and `features[8]` is the final 1×1 conv before pooling — together the closest analog to "the deepest, most task-specific block," matching the same freezing philosophy used for ResNet.
+
 ---
 
 ## 5. Results — Know Your Numbers Cold
+
+### Run 1 — Baseline ResNet50 (unweighted loss, no scheduler)
 
 | Metric | Value | One-line meaning |
 |---|---|---|
@@ -75,9 +86,34 @@ Practice saying this out loud. It's your opener for "tell me about a project."
 | Squamous cell | 0.67 precision, 0.89 recall | Absorbs the adenocarcinoma confusion |
 | Specificity per class | 0.83 – 1.00 | How well the model avoids false alarms per class |
 
-**The story in the numbers (memorize this):** the model is *perfect* at cancer vs. no-cancer — every error is between cancer *subtypes*, mainly adenocarcinoma being called squamous cell carcinoma. Clinically, subtype confusion is far less dangerous than missing a cancer. That framing turns your 81% into a strength.
+**The story in the numbers (memorize this):** the model is *perfect* at cancer vs. no-cancer — every error is between cancer *subtypes*, mainly adenocarcinoma being called squamous cell carcinoma. Clinically, subtype confusion is far less dangerous than missing a cancer. That framing turns 81% into a strength.
 
 **Why report Kappa/MCC/specificity at all?** Accuracy alone is misleading with imbalanced classes (a model predicting the majority class can score high while being useless). Kappa and MCC correct for chance and imbalance; specificity matters in medicine because false alarms cause unnecessary biopsies and anxiety.
+
+### Run 2 — Improved ResNet50 (class-weighted loss + LR scheduler + fixed augmentation + AMP)
+
+Diagnosis that motivated the change: the baseline's biggest weakness was adenocarcinoma (largest class, 195 train images) getting confused with squamous cell (155 train images) and large cell being the smallest class at 115 — a real, measurable class-imbalance signal in the baseline confusion matrix, not a guess.
+
+| Metric | Value |
+|---|---|
+| Test accuracy | **~83%** (confirmed) |
+| Weighted AUC-ROC | TBD — fill in from your notebook's saved output |
+| Cohen's Kappa | TBD |
+| MCC | TBD |
+| Per-class precision/recall | TBD |
+
+**Talking point:** "I didn't just re-run training hoping for a better number — I diagnosed the failure mode from the confusion matrix (adenocarcinoma/squamous confusion, consistent with class imbalance), then applied a targeted fix (class-weighted loss) plus general training hygiene (LR scheduling on plateau, removing color augmentations that don't make sense for grayscale CT images). That combination moved accuracy from 81.3% to about 83%." **Fill in the TBD cells above before using this in an interview** — a specific per-class number beats a rounded headline figure when a follow-up question drills in.
+
+### Run 3 — Architecture comparison: ResNet50 vs. EfficientNet-B0 (same protocol)
+
+| Metric | ResNet50 | EfficientNet-B0 |
+|---|---|---|
+| Test accuracy | TBD | TBD |
+| Weighted AUC-ROC | TBD | TBD |
+| Cohen's Kappa | TBD | TBD |
+| MCC | TBD | TBD |
+
+Run the comparison cells at the end of the notebook, then fill this table in from the printed comparison table and bar chart. Whichever model wins, you have a real answer to "did you try anything else?" — and if EfficientNet-B0 wins despite having 5x fewer parameters, that's a strong point about parameter efficiency on small medical datasets; if ResNet50 wins, that's a legitimate point about EfficientNet needing more data/tuning to reach its known strengths.
 
 ---
 
@@ -87,7 +123,7 @@ Practice saying this out loud. It's your opener for "tell me about a project."
 ~1,000 images is nowhere near enough to train a 25M-parameter network from scratch — it would either overfit badly or never learn. A pretrained ResNet50 already knows generic visual features from 1.2M ImageNet images; I only had to adapt its deepest layers to CT scans. It's also dramatically cheaper: I trained on a laptop GPU in a reasonable time.
 
 ### "Why ResNet50 and not something else?"
-It's a proven, well-understood baseline for transfer learning: deep enough to be expressive, small enough to fine-tune on modest hardware, and its residual connections make it stable to train. Honest add-on: "Given more time I'd benchmark EfficientNet or a Vision Transformer against it — ResNet50 was a deliberate strong baseline, not the end state."
+It's a proven, well-understood baseline for transfer learning: deep enough to be expressive, small enough to fine-tune on modest hardware, and its residual connections make it stable to train. I didn't stop there, though — I benchmarked EfficientNet-B0 against it under the identical training protocol to check whether a more parameter-efficient architecture would do better on this small dataset. (See the architecture comparison results — fill in your numbers and state which one won and why you think that happened.)
 
 ### "What's a residual connection?" (very common follow-up)
 A shortcut that adds a block's input directly to its output. It solves vanishing gradients in deep networks because gradients can flow back through the shortcut unimpeded, and each block only learns an adjustment rather than a full transformation.

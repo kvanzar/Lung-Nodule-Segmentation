@@ -3,4 +3,4 @@ best_resnet_model.pt
 __pycache__/
 .ipynb_checkpoints/
 .DS_Store
-dataset/
+Data/
